@@ -1,8 +1,16 @@
 # Reusable build + test stage.
 #
-# Builds the Docker image (never pushed here) and runs every gate that has to
-# pass before an image may be published:
-#   lint (prettier --check), typecheck, test (vitest)
+# Runs every check before an image may be published, in this order:
+#
+#   1. checks (parallel)  lint, typecheck, test,
+#                         dependency_scanning, secret_detection, sast
+#   2. build              Docker image (never pushed here)
+#   3. container_scanning scans the image built in 2
+#   4. vulnerability_report  combines all four scans into one artifact
+#
+# The caller's push job runs after all of this. lint/typecheck/test failing
+# stops the build (and so the push). Security scans are report-only: their
+# jobs use continue-on-error, so findings or a scanner error never block.
 
 name: _build-and-test
 
@@ -20,8 +28,11 @@ on:
                 value: ${{ jobs.build.outputs.image-artifact }}
 
 jobs:
+    # Stage 2: only builds once every stage-1 check is done, so a commit that
+    # fails lint/typecheck/test doesn't spend time building an image.
     build:
         name: build
+        needs: [lint, typecheck, test, dependency_scanning, secret_detection, sast]
         runs-on: ubuntu-24.04
         outputs:
             image-artifact: image-${{ github.run_id }}-${{ github.run_attempt }}
