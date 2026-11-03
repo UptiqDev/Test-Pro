@@ -57,40 +57,294 @@ jobs:
                   path: /tmp/image.tar
                   retention-days: 1
 
-    # GitLab-style downloadable report: scans the image built above and
-    # attaches the result to the run (Actions → run → Artifacts at the bottom).
-    # Report-only for now (exit-code 0): findings never fail the pipeline.
+    # ---- Security scans (GitLab-style downloadable report) ----
+    #
+    # Each scan saves its findings plus the full scanner log, and always uploads
+    # them, even when the scanner itself errors, so the exact issue is in the
+    # report. vulnerability_report then combines all four into ONE artifact:
+    #   Actions → run → Artifacts → vulnerability-report
+    #
+    # Report-only: findings never fail the pipeline. A scanner error marks that
+    # job red (continue-on-error keeps it from blocking the image push).
+
     container_scanning:
         name: container_scanning
         needs: build
+        if: ${{ !cancelled() }}
+        continue-on-error: true
         runs-on: ubuntu-24.04
         steps:
+            - uses: actions/checkout@v5
+              with:
+                  fetch-depth: 1
+                  ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+
+            # May be missing if build failed; the scan step reports that.
             - uses: actions/download-artifact@v7
+              continue-on-error: true
               with:
                   name: ${{ needs.build.outputs.image-artifact }}
                   path: /tmp
 
             # Trivy CLI from its official image, pinned to a release, scanning
             # the image tarball directly (no docker load needed).
-            - name: Run Trivy vulnerability scanner
+            - name: Run Trivy image scan
+              id: scan
+              env:
+                  BUILD_RESULT: ${{ needs.build.result }}
               run: |
-                  mkdir -p reports
-                  docker run --rm \
-                    -v /tmp/image.tar:/work/image.tar:ro \
-                    -v "$PWD/reports:/work/reports" \
-                    aquasec/trivy:0.76.1 image \
-                      --input /work/image.tar \
-                      --format table \
-                      --output /work/reports/trivy-report.txt \
-                      --exit-code 0
+                  set -o pipefail
+                  mkdir -p reports/_meta
+                  if [ ! -f /tmp/image.tar ]; then
+                    echo "Image artifact not available (build job result: $BUILD_RESULT). Nothing to scan." \
+                      | tee reports/container-scanning.log
+                    exit 1
+                  fi
+                  trivy() {
+                    docker run --rm -v /tmp/image.tar:/work/image.tar:ro -v "$PWD/reports:/work/reports" \
+                      aquasec/trivy:0.76.1 "$@"
+                  }
+                  trivy image --input /work/image.tar --no-progress --exit-code 0 \
+                    --format json --output /work/reports/container-scanning.json 2>&1 \
+                    | tee reports/container-scanning.log
+                  trivy convert --format table --output /work/reports/container-scanning.txt \
+                    /work/reports/container-scanning.json 2>&1 | tee -a reports/container-scanning.log
+                  jq -r '[.Results[]?.Vulnerabilities[]?.Severity] as $s
+                    | "critical \([$s[]|select(.=="CRITICAL")]|length), high \([$s[]|select(.=="HIGH")]|length), medium \([$s[]|select(.=="MEDIUM")]|length), low \([$s[]|select(.=="LOW")]|length)"' \
+                    reports/container-scanning.json > reports/_meta/container-scanning.count
 
-            # Runs even if the scan step fails, so a partial report is kept.
-            - name: Upload vulnerability report
+            - name: Build report section
+              if: always()
+              run: bash .github/scripts/report-section.sh container-scanning 'Container scanning' 'Trivy 0.76.1 (image)' '${{ steps.scan.outcome }}'
+
+            - name: Upload report
               if: always()
               uses: actions/upload-artifact@v6
               with:
-                  name: container-vulnerability-report
-                  path: reports/trivy-report.txt
+                  name: scan-container-scanning
+                  path: reports/
+                  retention-days: 1
+
+    dependency_scanning:
+        name: dependency_scanning
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v5
+              with:
+                  fetch-depth: 1
+                  ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+
+            # Scans yarn.lock / package.json for known-vulnerable packages.
+            - name: Run Trivy dependency scan
+              id: scan
+              run: |
+                  set -o pipefail
+                  mkdir -p reports/_meta
+                  trivy() {
+                    docker run --rm -v "$PWD:/src:ro" -v "$PWD/reports:/work/reports" aquasec/trivy:0.76.1 "$@"
+                  }
+                  trivy fs /src --scanners vuln --skip-dirs /src/reports --no-progress --exit-code 0 \
+                    --format json --output /work/reports/dependency-scanning.json 2>&1 \
+                    | tee reports/dependency-scanning.log
+                  trivy convert --format table --output /work/reports/dependency-scanning.txt \
+                    /work/reports/dependency-scanning.json 2>&1 | tee -a reports/dependency-scanning.log
+                  jq -r '[.Results[]?.Vulnerabilities[]?.Severity] as $s
+                    | "critical \([$s[]|select(.=="CRITICAL")]|length), high \([$s[]|select(.=="HIGH")]|length), medium \([$s[]|select(.=="MEDIUM")]|length), low \([$s[]|select(.=="LOW")]|length)"' \
+                    reports/dependency-scanning.json > reports/_meta/dependency-scanning.count
+
+            - name: Build report section
+              if: always()
+              run: bash .github/scripts/report-section.sh dependency-scanning 'Dependency scanning' 'Trivy 0.76.1 (fs)' '${{ steps.scan.outcome }}'
+
+            - name: Upload report
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                  name: scan-dependency-scanning
+                  path: reports/
+                  retention-days: 1
+
+    secret_detection:
+        name: secret_detection
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v5
+              with:
+                  # Gitleaks scans commit history, not just the working tree.
+                  fetch-depth: 0
+                  ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+
+            # Gitleaks CLI (MIT). Runs as the runner user so git accepts the
+            # checkout's ownership. Secrets are redacted in all output.
+            - name: Run Gitleaks
+              id: scan
+              run: |
+                  set -o pipefail
+                  mkdir -p reports/_meta
+                  docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
+                    git /repo --no-banner --no-color --redact --verbose --exit-code 0 \
+                    --report-format json --report-path /repo/reports/secret-detection.json 2>&1 \
+                    | tee reports/secret-detection.log
+                  jq -r 'if length == 0 then "No leaks found." else .[]
+                    | "\(.RuleID)  \(.File):\(.StartLine)  commit \(.Commit[0:12])  \(.Author)  \(.Date)" end' \
+                    reports/secret-detection.json > reports/secret-detection.txt
+                  jq -r '"\(length) secret(s)"' reports/secret-detection.json > reports/_meta/secret-detection.count
+
+            - name: Build report section
+              if: always()
+              run: bash .github/scripts/report-section.sh secret-detection 'Secret detection' 'Gitleaks 8.30.1' '${{ steps.scan.outcome }}'
+
+            - name: Upload report
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                  name: scan-secret-detection
+                  path: reports/
+                  retention-days: 1
+
+    sast:
+        name: sast
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/checkout@v5
+              with:
+                  fetch-depth: 1
+                  ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+
+            # Semgrep OSS engine: no account or token. --metrics=off opts out
+            # of telemetry. Without --error, findings don't fail the step;
+            # only a real scanner error does.
+            - name: Run Semgrep
+              id: scan
+              run: |
+                  mkdir -p reports/_meta
+                  # Findings go to the report files; stdout repeats them, so only
+                  # stderr (errors/warnings) is kept as the log.
+                  rc=0
+                  docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/src" -w /src semgrep/semgrep:1.182.1 \
+                    semgrep scan --config=p/default --config=p/typescript --metrics=off --quiet \
+                      --exclude=dist --exclude=node_modules --exclude=reports \
+                      --json-output=reports/sast.json --text-output=reports/sast.txt \
+                    > /dev/null 2> reports/sast.log || rc=$?
+                  cat reports/sast.log
+                  if [ "$rc" -ne 0 ]; then echo "Semgrep exited with code $rc" | tee -a reports/sast.log; exit "$rc"; fi
+                  jq -r '[.results[].extra.severity] as $s
+                    | "error \([$s[]|select(.=="ERROR")]|length), warning \([$s[]|select(.=="WARNING")]|length), info \([$s[]|select(.=="INFO")]|length)"' \
+                    reports/sast.json > reports/_meta/sast.count
+                  [ -s reports/sast.txt ] || echo 'No findings.' > reports/sast.txt
+
+            - name: Build report section
+              if: always()
+              run: bash .github/scripts/report-section.sh sast 'SAST' 'Semgrep 1.182.1 (p/default, p/typescript)' '${{ steps.scan.outcome }}'
+
+            - name: Upload report
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                  name: scan-sast
+                  path: reports/
+                  retention-days: 1
+
+    # Combines the four scans into ONE downloadable artifact. Runs even when a
+    # scan failed or never ran; that scan's section then says why.
+    vulnerability_report:
+        name: vulnerability_report
+        needs: [container_scanning, dependency_scanning, secret_detection, sast]
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/download-artifact@v7
+              continue-on-error: true
+              with:
+                  pattern: scan-*
+                  path: reports
+                  merge-multiple: true
+
+            - name: Build vulnerability-report.txt
+              env:
+                  NEEDS: ${{ toJSON(needs) }}
+                  REPO: ${{ github.repository }}
+                  REF: ${{ inputs.ref != '' && inputs.ref || github.ref_name }}
+                  SHA: ${{ github.sha }}
+                  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+              run: |
+                  set -u
+                  mkdir -p reports/_meta
+                  out=reports/vulnerability-report.txt
+                  scans='container-scanning dependency-scanning secret-detection sast'
+
+                  {
+                    echo 'VULNERABILITY REPORT'
+                    echo "Repository : $REPO"
+                    echo "Ref        : $REF"
+                    echo "Commit     : $SHA"
+                    echo "Run        : $RUN_URL"
+                    echo "Generated  : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+                    echo
+                    printf '%-22s %-34s %s\n' 'SCAN' 'STATUS' 'FINDINGS'
+                    for id in $scans; do
+                      if [ -f "reports/_meta/$id.summary" ]; then
+                        IFS=$'\t' read -r title status findings < "reports/_meta/$id.summary"
+                      else
+                        title=$id; findings='-'
+                        status="NO REPORT (job: $(jq -r --arg j "${id//-/_}" '.[$j].result' <<< "$NEEDS"))"
+                      fi
+                      printf '%-22s %-34s %s\n' "$title" "$status" "$findings"
+                    done
+                    echo
+                    for id in $scans; do
+                      if [ -f "reports/_meta/$id.section.txt" ]; then
+                        cat "reports/_meta/$id.section.txt"
+                      else
+                        echo '================================================================'
+                        echo " $id: no report uploaded (job: $(jq -r --arg j "${id//-/_}" '.[$j].result' <<< "$NEEDS"))"
+                        echo '================================================================'
+                        echo
+                      fi
+                    done
+                  } > "$out"
+
+                  # Same summary table on the run page.
+                  {
+                    echo '## Vulnerability report'
+                    echo
+                    echo '| Scan | Status | Findings |'
+                    echo '| --- | --- | --- |'
+                    for id in $scans; do
+                      if [ -f "reports/_meta/$id.summary" ]; then
+                        IFS=$'\t' read -r title status findings < "reports/_meta/$id.summary"
+                        echo "| $title | $status | $findings |"
+                      else
+                        echo "| $id | no report | - |"
+                      fi
+                    done
+                    echo
+                    echo 'Download **vulnerability-report** under Artifacts below for full details and scanner logs.'
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+                  head -20 "$out"
+
+            - name: Upload combined report
+              uses: actions/upload-artifact@v6
+              with:
+                  name: scan-00-report
+                  path: reports/vulnerability-report.txt
+                  retention-days: 1
+
+            # Folds every scan-* artifact into one and deletes the originals.
+            - name: Merge into single artifact
+              uses: actions/upload-artifact/merge@v6
+              with:
+                  name: vulnerability-report
+                  pattern: scan-*
+                  delete-merged: true
                   retention-days: 14
 
     lint:
