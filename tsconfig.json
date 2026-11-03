@@ -1,0 +1,28 @@
+{
+    "compilerOptions": {
+        "incremental": false,
+        "esModuleInterop": true,
+        "skipLibCheck": true,
+        "target": "esnext",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext",
+        "resolveJsonModule": true,
+        "moduleDetection": "force",
+        "isolatedModules": true,
+        "strict": true,
+        "noUnusedLocals": true,
+        "lib": ["ESNext"],
+        "types": ["node"],
+        "outDir": "dist",
+        "rootDir": "src",
+        "noEmit": false,
+        "paths": {
+            "@error": ["./src/error/index.ts"],
+            "@modules": ["./src/modules/index.ts"]
+        },
+        "allowImportingTsExtensions": true,
+        "rewriteRelativeImportExtensions": true
+    },
+    "include": ["src"],
+    "exclude": ["src/**/__tests__/**"]
+}

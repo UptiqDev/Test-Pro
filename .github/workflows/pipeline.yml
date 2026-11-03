@@ -1,0 +1,41 @@
+# Build -> test -> push pipeline.
+#
+# Behavior:
+#   - push to any branch / pull request -> build + test only
+#   - push to main (i.e. PR merge)      -> build + test + push (short-SHA image)
+
+name: pipeline
+
+on:
+    push:
+        branches:
+            - '**'
+        tags-ignore:
+            - '**'
+    pull_request:
+
+concurrency:
+    group: pipeline-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+jobs:
+    build-and-test:
+        uses: ./.github/workflows/_build-and-test.yml
+
+    # Only on main, and only once every check has passed. Tagged with the short
+    # commit SHA; releases are tagged with their version instead (tag-and-push.yml).
+    push_dev:
+        name: push_dev
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        needs: build-and-test
+        permissions:
+            contents: read
+            packages: write
+        uses: ./.github/workflows/_push.yml
+        with:
+            image-tag: ${{ github.sha }}
+            image-artifact: ${{ needs.build-and-test.outputs.image-artifact }}
+            shorten-tag: true

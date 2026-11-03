@@ -1,0 +1,65 @@
+# Cuts a release tag and pushes the matching image.
+#
+# Runs tag-release.sh, which creates/fast-forwards the release/x.y.z branch and
+# pushes the a.b.c.d tag, then builds that tag and pushes it to GHCR tagged with
+# the version itself (e.g. 1.0.2.0).
+#
+# A tag pushed with the default GITHUB_TOKEN does not trigger other workflows,
+# which is why the build is chained here directly rather than triggered by the tag.
+
+name: tag-and-push
+
+on:
+    workflow_dispatch:
+        inputs:
+            release:
+                description: 'RELEASE version a.b.c.d (e.g. 1.0.0.0)'
+                required: true
+                type: string
+            source_branch:
+                description: 'Branch to cut the release from (leave empty to use the branch selected in "Use workflow from")'
+                required: false
+                type: string
+                default: ''
+
+permissions:
+    contents: write
+
+concurrency:
+    group: tag-and-push-${{ inputs.release }}
+    cancel-in-progress: false
+
+jobs:
+    create-tag:
+        name: Create Tag
+        runs-on: ubuntu-24.04
+        env:
+            RELEASE: ${{ inputs.release }}
+            SOURCE_BRANCH: ${{ inputs.source_branch != '' && inputs.source_branch || github.ref_name }}
+        steps:
+            - uses: actions/checkout@v5
+              with:
+                  # tag-release.sh needs real history to fast-forward the release branch.
+                  fetch-depth: 0
+
+            - name: Run tag-release.sh
+              run: |
+                  chmod +x ./tag-release.sh
+                  ./tag-release.sh
+
+    # Same gates as the per-push pipeline, run against the tag just created.
+    build-and-test:
+        needs: create-tag
+        uses: ./.github/workflows/_build-and-test.yml
+        with:
+            ref: ${{ inputs.release }}
+
+    push_release:
+        needs: build-and-test
+        permissions:
+            contents: read
+            packages: write
+        uses: ./.github/workflows/_push.yml
+        with:
+            image-tag: ${{ inputs.release }}
+            image-artifact: ${{ needs.build-and-test.outputs.image-artifact }}

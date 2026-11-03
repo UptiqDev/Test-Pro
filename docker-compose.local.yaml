@@ -1,0 +1,25 @@
+networks:
+    main:
+
+volumes:
+    node_modules:
+
+services:
+    server:
+        container_name: test-pro-server
+        build:
+            context: .
+            dockerfile: Dockerfile.local
+        env_file:
+            - path: .env.local
+              required: false
+        environment:
+            - ENV=local
+            - PORT=3000
+        ports:
+            - ${HOST_PORT:-3000}:3000
+        volumes:
+            - .:/app
+            - node_modules:/app/node_modules
+        networks:
+            - main

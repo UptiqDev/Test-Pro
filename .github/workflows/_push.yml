@@ -1,0 +1,112 @@
+# Reusable push workflow — GitHub Container Registry (ghcr.io) target.
+#
+# Takes the image that _build-and-test.yml already built and publishes it.
+# The image is never rebuilt here: what was tested is what ships. VERSION is
+# applied as an image env var (the app reads it from the environment at
+# runtime) so no rebuild is needed to stamp the version.
+#
+# One registry, one image. The tag is the only thing that varies:
+#   8f3c2a1b9d4e   short commit SHA, pushed automatically on merge to main
+#   1.0.2.0        release version, pushed when tag-and-push.yml is run
+#
+# Published as ghcr.io/<owner>/<repo>:<tag> using the built-in GITHUB_TOKEN —
+# no extra secrets needed. The caller job must grant `packages: write`.
+
+name: _push
+
+on:
+    workflow_call:
+        inputs:
+            image-tag:
+                description: 'Tag to push the image as (e.g. 1.0.2.0, or a commit SHA with shorten-tag)'
+                required: true
+                type: string
+            image-artifact:
+                description: 'Artifact name holding the built image tarball'
+                required: true
+                type: string
+            shorten-tag:
+                description: 'Truncate image-tag to 12 characters (used for commit SHAs)'
+                required: false
+                type: boolean
+                default: false
+
+jobs:
+    push:
+        name: Push Docker Image
+        runs-on: ubuntu-24.04
+        permissions:
+            contents: read
+            packages: write
+        env:
+            REGISTRY: ghcr.io
+        steps:
+            # Release versions are used as-is; commit SHAs are truncated to 12.
+            # ghcr.io requires a lowercase image path.
+            - name: Resolve image tag
+              env:
+                  RAW_TAG: ${{ inputs.image-tag }}
+                  SHORTEN: ${{ inputs.shorten-tag }}
+                  REPOSITORY: ${{ github.repository }}
+              run: |
+                  set -e
+                  if [ "$SHORTEN" = "true" ]; then
+                    VERSION_TAG="${RAW_TAG:0:12}"
+                  else
+                    VERSION_TAG="${RAW_TAG}"
+                  fi
+                  IMAGE_NAME=$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')
+                  echo "VERSION_TAG=${VERSION_TAG}" >> "$GITHUB_ENV"
+                  echo "IMAGE_URI=${REGISTRY}/${IMAGE_NAME}:${VERSION_TAG}" >> "$GITHUB_ENV"
+
+            - name: Authenticate to GitHub Container Registry
+              env:
+                  TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  ACTOR: ${{ github.actor }}
+              run: |
+                  set -e
+                  printf '%s' "$TOKEN" | docker login -u "$ACTOR" --password-stdin "$REGISTRY"
+
+            # Published tags are never overwritten. A re-run for a tag that is
+            # already in the registry is a no-op. Only a "not found" answer
+            # counts as absent — auth or network errors fail the job instead.
+            - name: Check whether the tag is already published
+              id: existing
+              run: |
+                  set +e
+                  OUTPUT=$(docker manifest inspect "$IMAGE_URI" 2>&1)
+                  STATUS=$?
+                  set -e
+                  if [ "$STATUS" -eq 0 ]; then
+                    echo "::notice::$IMAGE_URI is already published — not pushing it again."
+                    echo "published=true" >> "$GITHUB_OUTPUT"
+                  elif printf '%s' "$OUTPUT" | grep -qiE 'manifest unknown|no such manifest|not found'; then
+                    echo "published=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "Could not check the registry for $IMAGE_URI:"
+                    echo "$OUTPUT"
+                    exit 1
+                  fi
+
+            - uses: actions/download-artifact@v7
+              if: steps.existing.outputs.published == 'false'
+              with:
+                  name: ${{ inputs.image-artifact }}
+                  path: /tmp
+
+            # Stamps VERSION onto the already-built image. This adds a metadata
+            # layer only — the filesystem stays byte-identical to what was tested.
+            - name: Load image and stamp version
+              if: steps.existing.outputs.published == 'false'
+              run: |
+                  set -e
+                  docker load -i /tmp/image.tar
+                  printf 'FROM test-pro:built\nENV VERSION=%s\n' "$VERSION_TAG" \
+                    | docker build -t "$IMAGE_URI" -f - .
+
+            - name: Push to GHCR
+              if: steps.existing.outputs.published == 'false'
+              run: |
+                  set -e
+                  docker push "$IMAGE_URI"
+                  echo "Successfully pushed $IMAGE_URI"

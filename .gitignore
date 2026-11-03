@@ -1,0 +1,14 @@
+# Node artifact files
+node_modules/
+dist/
+coverage/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Never commit real env files
+.env
+.env.*
+*.env
+!.env.example

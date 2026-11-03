@@ -1,0 +1,10 @@
+FROM node:22-bookworm
+
+WORKDIR /app
+
+EXPOSE 3000
+
+COPY entrypoint.local.sh /entrypoint.local.sh
+RUN chmod +x /entrypoint.local.sh
+
+ENTRYPOINT ["/entrypoint.local.sh"]
