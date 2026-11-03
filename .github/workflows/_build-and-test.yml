@@ -57,6 +57,42 @@ jobs:
                   path: /tmp/image.tar
                   retention-days: 1
 
+    # GitLab-style downloadable report: scans the image built above and
+    # attaches the result to the run (Actions → run → Artifacts at the bottom).
+    # Report-only for now (exit-code 0): findings never fail the pipeline.
+    container_scanning:
+        name: container_scanning
+        needs: build
+        runs-on: ubuntu-24.04
+        steps:
+            - uses: actions/download-artifact@v7
+              with:
+                  name: ${{ needs.build.outputs.image-artifact }}
+                  path: /tmp
+
+            # Trivy CLI from its official image, pinned to a release, scanning
+            # the image tarball directly (no docker load needed).
+            - name: Run Trivy vulnerability scanner
+              run: |
+                  mkdir -p reports
+                  docker run --rm \
+                    -v /tmp/image.tar:/work/image.tar:ro \
+                    -v "$PWD/reports:/work/reports" \
+                    aquasec/trivy:0.76.1 image \
+                      --input /work/image.tar \
+                      --format table \
+                      --output /work/reports/trivy-report.txt \
+                      --exit-code 0
+
+            # Runs even if the scan step fails, so a partial report is kept.
+            - name: Upload vulnerability report
+              if: always()
+              uses: actions/upload-artifact@v6
+              with:
+                  name: container-vulnerability-report
+                  path: reports/trivy-report.txt
+                  retention-days: 14
+
     lint:
         name: lint
         runs-on: ubuntu-24.04
